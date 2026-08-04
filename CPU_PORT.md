@@ -2,8 +2,14 @@
 
 本家 [karpathy/autoresearch](https://github.com/karpathy/autoresearch) は**単一 NVIDIA GPU（H100 想定）専用**です。
 このリポジトリはそれを **CPU で動く小規模学習環境**へ移植したフォークで、`cpu-local` ブランチに変更が入っています。
-`master` ブランチは upstream そのままです。移植分はまだ未コミットなので、現時点では `git diff` で全差分を確認できます
-（`cpu-local` にコミットした後は `git diff master cpu-local`）。
+`master` ブランチは upstream そのままなので、`git diff master cpu-local` で全差分を確認できます。
+
+remote は 2 つあります。
+
+| remote | 参照先 | 用途 |
+| --- | --- | --- |
+| `origin` | `1llum1n4t1s/KG.autoresearch` | このフォーク。移植分の push 先 |
+| `upstream` | `karpathy/autoresearch` | 本家。`git fetch upstream` で追従する |
 
 ## なぜ移植が必要だったか
 
