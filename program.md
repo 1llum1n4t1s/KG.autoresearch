@@ -2,6 +2,16 @@
 
 This is an experiment to have the LLM do its own research.
 
+> **このフォークは CPU 実行版です。** 本家（単一 NVIDIA GPU / H100 前提）から次の点が変わっています。
+> 詳細は `CPU_PORT.md` を読んでください。
+>
+> - attention は FlashAttention-3 ではなく `F.scaled_dot_product_attention`（`train.py` の `attention()`）
+> - `torch.compile` は CUDA のときだけ有効（`USE_COMPILE`）
+> - データは TinyStories（GPT-4 生成の短編）、単一 parquet を row group で train/val 分割
+> - モデルとデータの規模を大幅に縮小（`DEPTH=4`, `MAX_SEQ_LEN=256`, `VOCAB_SIZE=2048` など）
+> - `peak_vram_mb` は CPU 実行では常に 0.0 になる。VRAM の代わりにプロセスの RAM 使用量に気を配る
+> - **val_bpb の絶対値は本家や他プラットフォームの数値と比較できません。** 比較対象はこのマシンで取った自分の過去 run だけです
+
 ## Setup
 
 To set up a new experiment, work with the user to:
@@ -12,7 +22,7 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
+4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains `data/tinystories_gpt4_clean.parquet` and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -20,7 +30,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single device (this fork: the CPU). The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
@@ -32,7 +42,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically. CPU 実行では `peak_vram_mb` が 0.0 固定になるので、代わりにメモリを使いすぎて OS がスワップし始めていないかで判断すること。
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
