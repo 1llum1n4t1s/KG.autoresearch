@@ -17,13 +17,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+from prepare import DEVICE, MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+# CPU 版: FlashAttention-3 (kernels) は CUDA 専用なので、PyTorch 標準の
+# scaled_dot_product_attention へ置き換えている。sliding window は明示マスクで表現する。
+
+_window_mask_cache = {}
+
+
+def _sliding_window_mask(T, window, device):
+    """causal かつ (i - j) < window の bool マスクを返す（True = 参照可能）。"""
+    key = (T, window, device)
+    mask = _window_mask_cache.get(key)
+    if mask is None:
+        idx = torch.arange(T, device=device)
+        delta = idx[:, None] - idx[None, :]
+        mask = (delta >= 0) & (delta < window)
+        _window_mask_cache[key] = mask
+    return mask
+
+
+def attention(q, k, v, window_size):
+    """
+    FA3 の flash_attn_func 互換ラッパー。
+    入出力は (B, T, H, D) レイアウト。window_size は FA3 と同じ (left, right)。
+    """
+    T = q.size(1)
+    # SDPA は (B, H, T, D) を取る
+    q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+    enable_gqa = q.size(1) != k.size(1)
+    left = window_size[0]
+    if left is None or left < 0 or left >= T:
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+    else:
+        # FA3 の window_size=(left, 0) は自分を含めて left+1 トークン参照できる
+        attn_mask = _sliding_window_mask(T, left + 1, q.device)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+    return y.transpose(1, 2)
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -90,7 +120,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -302,7 +332,15 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+# CPU 版: torch.compile (inductor) は Windows CPU だと C++ コンパイラを要求して落ちるため、
+# CUDA のときだけ有効にする。CUDA 環境へ戻せば本家と同じ挙動になる。
+USE_COMPILE = DEVICE.type == "cuda"
+
+
+def maybe_compile(fn, **kwargs):
+    return torch.compile(fn, **kwargs) if USE_COMPILE else fn
+
+
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,7 +351,6 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -351,6 +388,10 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+adamw_step_fused = maybe_compile(adamw_step_fused, dynamic=False, fullgraph=True)
+muon_step_fused = maybe_compile(muon_step_fused, dynamic=False, fullgraph=True)
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -429,13 +470,15 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+# CPU 版のスケールダウン: 本家（H100 前提）の値は各行のコメントに残す
+
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+HEAD_DIM = 64           # target head dimension for attention（本家 128）
+WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context（本家 "SSSL"）
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**14 # ~16K tokens per optimizer step（本家 2**19）
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -447,8 +490,8 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEPTH = 4               # number of transformer layers（本家 8）
+DEVICE_BATCH_SIZE = 16  # per-device batch size (reduce if OOM)（本家 128）
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -456,11 +499,20 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+device = DEVICE
+if device.type == "cuda":
+    torch.cuda.manual_seed(42)
+print(f"Device: {device} (torch.compile: {USE_COMPILE})")
+autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
+# MFU の基準 FLOPS。CPU 実行では H100 基準の mfu 値は目安にならない。
 H100_BF16_PEAK_FLOPS = 989.5e12
+
+
+def sync():
+    """デバイス側の非同期処理を待つ（CPU では no-op）。"""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -505,7 +557,8 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if USE_COMPILE:
+    model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -541,7 +594,7 @@ total_training_time = 0
 step = 0
 
 while True:
-    torch.cuda.synchronize()
+    sync()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
@@ -571,7 +624,7 @@ while True:
         print("FAIL")
         exit(1)
 
-    torch.cuda.synchronize()
+    sync()
     t1 = time.time()
     dt = t1 - t0
 
@@ -616,7 +669,7 @@ with autocast_ctx:
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024 if device.type == "cuda" else 0.0
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
