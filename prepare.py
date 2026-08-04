@@ -1,10 +1,9 @@
 """
 One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Downloads the TinyStories parquet dataset and trains a BPE tokenizer.
 
 Usage:
     python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
 
 Data and tokenizer are stored in ~/.cache/autoresearch/.
 """
@@ -15,7 +14,6 @@ import time
 import math
 import argparse
 import pickle
-from multiprocessing import Pool
 
 import requests
 import pyarrow.parquet as pq
@@ -27,9 +25,10 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
+# CPU 版のスケールダウン: 本家（H100 前提）の値は各行のコメントに残す
+MAX_SEQ_LEN = 256        # context length（本家 2048）
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+EVAL_TOKENS = 2 * 65536  # number of tokens for val eval（本家 40*524288）
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -38,11 +37,26 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+# CPU 版はエントロピーの低い TinyStories(GPT-4 生成の短編) を使う。
+# 本家は climbmix-400b-shuffle を 6543 個の shard に分けて配布しているが、
+# TinyStories は単一 parquet なので「末尾の row group を val に固定」して分割する。
+BASE_URL = "https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean/resolve/main"
+DATA_FILENAME = "tinystories_gpt4_clean.parquet"
+NUM_VAL_ROW_GROUPS = 1   # 末尾 N row group を検証用に固定（train からは除外）
+VOCAB_SIZE = 2048        # 本家 8192
+
+
+def get_device():
+    """CUDA > MPS > CPU の順に利用可能なデバイスを選ぶ。"""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = get_device()
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -54,9 +68,8 @@ BOS_TOKEN = "<|reserved_0|>"
 # Data download
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
+def download_file(filename):
+    """Download one parquet file with retries. Returns True on success."""
     filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):
         return True
@@ -88,54 +101,52 @@ def download_single_shard(index):
     return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def download_data():
+    """Download the single TinyStories parquet file (~640MB)."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+    filepath = os.path.join(DATA_DIR, DATA_FILENAME)
+    if os.path.exists(filepath):
+        print(f"Data: {DATA_FILENAME} already downloaded at {DATA_DIR}")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    print(f"Data: downloading {DATA_FILENAME} (~640MB)...")
+    if not download_file(DATA_FILENAME):
+        print(f"Data: failed to download {DATA_FILENAME}")
+        sys.exit(1)
+    print(f"Data: ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def data_path():
+    """Path to the single parquet data file."""
+    path = os.path.join(DATA_DIR, DATA_FILENAME)
+    assert os.path.exists(path), f"{path} not found. Run prepare.py first."
+    return path
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
+def row_group_split(num_row_groups):
+    """末尾 NUM_VAL_ROW_GROUPS 個を val に固定し、(train, val) の row group 番号を返す。"""
+    assert num_row_groups > NUM_VAL_ROW_GROUPS, \
+        f"row groups ({num_row_groups}) must exceed NUM_VAL_ROW_GROUPS ({NUM_VAL_ROW_GROUPS})"
+    split = num_row_groups - NUM_VAL_ROW_GROUPS
+    return list(range(split)), list(range(split, num_row_groups))
+
+
+def text_iterator(max_chars=100_000_000, doc_cap=10_000):
+    """Yield documents from the training split (val row groups excluded)."""
+    pf = pq.ParquetFile(data_path())
+    train_rgs, _ = row_group_split(pf.num_row_groups)
     nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+    for rg_idx in train_rgs:
+        rg = pf.read_row_group(rg_idx)
+        for text in rg.column("text").to_pylist():
+            doc = text[:doc_cap] if len(text) > doc_cap else text
+            nchars += len(doc)
+            yield doc
+            if nchars >= max_chars:
+                return
 
 
 def train_tokenizer():
@@ -149,9 +160,8 @@ def train_tokenizer():
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+    if not os.path.exists(os.path.join(DATA_DIR, DATA_FILENAME)):
+        print(f"Tokenizer: {DATA_FILENAME} not found. Download data first.")
         sys.exit(1)
 
     # --- Train with rustbpe ---
@@ -252,24 +262,18 @@ def get_token_bytes(device="cpu"):
 
 
 def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
+    """Infinite iterator over document batches from the parquet file's row groups."""
+    pf = pq.ParquetFile(data_path())
+    train_rgs, val_rgs = row_group_split(pf.num_row_groups)
+    row_groups = train_rgs if split == "train" else val_rgs
+    assert len(row_groups) > 0, f"No row groups for split={split}."
     epoch = 1
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        for rg_idx in row_groups:
+            rg = pf.read_row_group(rg_idx)
+            batch = rg.column('text').to_pylist()
+            for i in range(0, len(batch), tokenizer_batch_size):
+                yield batch[i:i+tokenizer_batch_size], epoch
         epoch += 1
 
 
@@ -295,12 +299,14 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    # pin_memory と non_blocking 転送は CUDA 専用。CPU/MPS では素直に確保する。
+    use_pinned = DEVICE.type == "cuda"
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_pinned)
+    device_buffer = torch.empty(2 * B * T, dtype=torch.long, device=DEVICE)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    inputs = device_buffer[:B * T].view(B, T)
+    targets = device_buffer[B * T:].view(B, T)
 
     while True:
         for row_idx in range(B):
@@ -333,7 +339,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        device_buffer.copy_(cpu_buffer, non_blocking=use_pinned)
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -349,7 +355,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
+    token_bytes = get_token_bytes(device=DEVICE)
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
@@ -370,17 +376,14 @@ def evaluate_bpb(model, tokenizer, batch_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    parser.parse_args()
 
     print(f"Cache directory: {CACHE_DIR}")
+    print(f"Device: {DEVICE}")
     print()
 
     # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    download_data()
     print()
 
     # Step 2: Train tokenizer
